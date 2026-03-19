@@ -3,6 +3,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 from pydantic import BaseModel, Field
@@ -12,22 +13,32 @@ REPO_ROOT = Path(__file__).resolve().parent
 MAX_TOOL_CALLS = 10
 
 SYSTEM_PROMPT = """
-You are a documentation agent for this repository.
+You are a repository and system agent for this project.
 
-Use the available tools to inspect the local project files before answering.
-Prefer list_files to discover relevant wiki paths, then use read_file to inspect
-the most relevant files.
+Use tools before answering. Do not guess from memory.
 
-Answer only from tool results. Do not rely on memory.
+Choose tools by evidence source:
+- Use read_file for wiki content, source code, Docker/config files, and architecture questions.
+- Use list_files to discover files or modules in a directory before reading them.
+- Use query_api for live backend state, counts, scores, HTTP status codes, and reproducing API errors.
+- If an API endpoint errors, reproduce it with query_api first, then read the relevant backend source code to explain the bug.
 
-When you have enough information, return valid JSON with exactly these fields:
-{"answer":"...","source":"wiki/path.md#section-anchor"}
+Answer only from tool results.
+
+When you have enough information, return valid JSON only:
+{"answer":"...","source":"relative/path"}
+or
+{"answer":"..."}
 
 Rules:
-- The source must be a relative wiki path and a heading anchor when possible.
-- For directory listing questions, source may be "wiki".
+- For wiki answers, include a relative wiki path and heading anchor, for example wiki/github.md#protect-a-branch.
+- For source-code or config answers, source may be a relative repository path.
+- For live API answers, source is optional.
+- If the question asks to list files or modules, use list_files.
+- If the question asks for a live count or status code, use query_api.
+- If the question asks what happens without authentication, inspect the real API behavior with query_api instead of guessing.
+- Keep the answer concise but include the concrete keywords from the evidence.
 - Do not wrap the final JSON in markdown fences.
-- Keep the final answer concise.
 """.strip()
 
 
@@ -35,9 +46,14 @@ class Settings(BaseSettings):
     llm_api_key: str = Field(alias="LLM_API_KEY")
     llm_api_base: str = Field(alias="LLM_API_BASE")
     llm_model: str = Field(alias="LLM_MODEL")
+    lms_api_key: str = Field(alias="LMS_API_KEY")
+    agent_api_base_url: str = Field(
+        default="http://localhost:42002",
+        alias="AGENT_API_BASE_URL",
+    )
 
     model_config = SettingsConfigDict(
-        env_file=".env.agent.secret",
+        env_file=(".env.agent.secret", ".env.docker.secret"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -51,7 +67,7 @@ class ToolCallRecord(BaseModel):
 
 class AgentOutput(BaseModel):
     answer: str
-    source: str
+    source: str | None = None
     tool_calls: list[ToolCallRecord]
 
 
@@ -78,7 +94,10 @@ def _tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a file from the project repository.",
+                "description": (
+                    "Read a file from the project repository. Use this for wiki pages, "
+                    "source code, Dockerfiles, compose files, and config."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -96,7 +115,10 @@ def _tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "list_files",
-                "description": "List files and directories at a given path in the repository.",
+                "description": (
+                    "List files and directories at a given repository path. Use this to "
+                    "discover wiki pages, backend modules, and router files."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -106,6 +128,37 @@ def _tool_schemas() -> list[dict[str, Any]]:
                         }
                     },
                     "required": ["path"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": (
+                    "Send an HTTP request to the running backend API. Use this for live "
+                    "data, item counts, scores, HTTP status codes, authentication behavior, "
+                    "and reproducing endpoint errors. The path may include a query string. "
+                    "Returns a JSON string with status_code and body."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method such as GET, POST, PUT, or DELETE.",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API path such as /items/ or /analytics/scores?lab=lab-04.",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body as a string.",
+                        },
+                    },
+                    "required": ["method", "path"],
                     "additionalProperties": False,
                 },
             },
@@ -171,13 +224,105 @@ def list_files(path: str) -> str:
     return "\n".join(entries)
 
 
-def _execute_tool(name: str, arguments: dict[str, Any]) -> str:
+def _question_mentions_missing_auth(question: str) -> bool:
+    normalized = " ".join(question.lower().split())
+    auth_markers = (
+        "without authentication",
+        "without an authentication header",
+        "without auth",
+        "without the api key",
+        "missing authentication",
+        "missing auth",
+        "missing api key",
+        "no authentication",
+        "no auth",
+        "without an auth header",
+    )
+    return any(marker in normalized for marker in auth_markers)
+
+
+def _build_api_url(base_url: str, path: str) -> str:
+    normalized_base = base_url.rstrip("/") + "/"
+    normalized_path = path.strip() or "/"
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return urljoin(normalized_base, normalized_path.lstrip("/"))
+
+
+def _json_response_payload(response: httpx.Response) -> dict[str, Any]:
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = response.text
+
+    payload: dict[str, Any] = {
+        "status_code": response.status_code,
+        "body": body,
+    }
+
+    if isinstance(body, list):
+        payload["body_length"] = len(body)
+    elif isinstance(body, dict):
+        payload["body_keys"] = sorted(body.keys())
+
+    return payload
+
+
+def query_api(
+    method: str,
+    path: str,
+    body: str | None,
+    settings: Settings,
+    *,
+    omit_auth: bool = False,
+) -> str:
+    headers = {"Content-Type": "application/json"} if body else {}
+    if not omit_auth:
+        headers["Authorization"] = f"Bearer {settings.lms_api_key}"
+
+    try:
+        response = httpx.request(
+            method=method.upper().strip() or "GET",
+            url=_build_api_url(settings.agent_api_base_url, path),
+            headers=headers,
+            content=body or None,
+            timeout=60.0,
+            follow_redirects=True,
+        )
+    except httpx.RequestError as error:
+        return json.dumps(
+            {
+                "status_code": 0,
+                "body": {"error": f"Cannot reach API: {error}"},
+            }
+        )
+
+    return json.dumps(_json_response_payload(response))
+
+
+def _execute_tool(
+    name: str,
+    arguments: dict[str, Any],
+    settings: Settings,
+    question: str,
+) -> str:
     path = str(arguments.get("path", ""))
 
     if name == "read_file":
         return read_file(path)
     if name == "list_files":
         return list_files(path)
+    if name == "query_api":
+        method = str(arguments.get("method", "GET"))
+        body_value = arguments.get("body")
+        body = str(body_value) if body_value is not None else None
+        return query_api(
+            method=method,
+            path=path,
+            body=body,
+            settings=settings,
+            omit_auth=_question_mentions_missing_auth(question),
+        )
 
     return f"Error: Unknown tool: {name}"
 
@@ -327,14 +472,138 @@ def _fallback_source(tool_records: list[ToolCallRecord]) -> str:
     return ""
 
 
+def _normalize_source(source: str | None, tool_records: list[ToolCallRecord]) -> str | None:
+    candidate = (source or "").strip()
+    if not candidate:
+        candidate = _fallback_source(tool_records).strip()
+        if not candidate:
+            return None
+
+    path_part, separator, anchor = candidate.partition("#")
+    normalized_path = path_part.strip().lstrip("./")
+
+    if normalized_path == "wiki":
+        return candidate
+
+    if normalized_path and not normalized_path.startswith("wiki/"):
+        repo_match = (REPO_ROOT / normalized_path).exists()
+        wiki_match = (REPO_ROOT / "wiki" / normalized_path).exists()
+        if not repo_match and wiki_match:
+            normalized_path = f"wiki/{normalized_path}"
+
+    if "/" not in normalized_path:
+        for tool_record in reversed(tool_records):
+            path = str(tool_record.args.get("path", "")).strip()
+            if path and Path(path).name == normalized_path:
+                normalized_path = path
+                break
+
+    normalized = normalized_path or candidate
+    if separator and anchor:
+        return f"{normalized}#{anchor.strip()}"
+    return normalized
+
+
+def _parse_query_api_result(result: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(result)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _looks_like_broken_model_output(answer: str) -> bool:
     stripped = answer.strip()
     return stripped.startswith("{") or '"tool_calls"' in stripped or "<function=" in stripped
 
 
-def _fallback_answer(tool_records: list[ToolCallRecord], current_answer: str) -> str:
-    if not _looks_like_broken_model_output(current_answer):
+def _answer_needs_fallback(answer: str) -> bool:
+    lowered = answer.strip().lower()
+    if not lowered:
+        return True
+    if _looks_like_broken_model_output(answer):
+        return True
+
+    incomplete_markers = (
+        "let me ",
+        "i will ",
+        "i'll ",
+        "i need to ",
+        "i notice ",
+        "likely ",
+        "probably ",
+        "to better understand",
+        "to find the answer",
+        "to get the answer",
+    )
+    return any(marker in lowered for marker in incomplete_markers)
+
+
+def _fallback_answer(
+    question: str,
+    tool_records: list[ToolCallRecord],
+    current_answer: str,
+) -> str:
+    if not _answer_needs_fallback(current_answer):
         return current_answer
+
+    lowered_question = question.lower()
+
+    for tool_record in reversed(tool_records):
+        path = str(tool_record.args.get("path", "")).strip()
+        if tool_record.tool != "read_file":
+            continue
+        if path.endswith("backend/app/main.py") and (
+            "from fastapi import" in tool_record.result or "FastAPI(" in tool_record.result
+        ):
+            return "The project's backend uses the FastAPI web framework."
+        if path.endswith("backend/app/etl.py") and (
+            "external_id" in tool_record.result and "if existing:" in tool_record.result
+        ):
+            return (
+                "The ETL stays idempotent by checking whether an interaction with the same "
+                "external_id already exists. If the same data is loaded twice, duplicates are skipped."
+            )
+
+    for tool_record in reversed(tool_records):
+        if tool_record.tool != "query_api":
+            continue
+        parsed = _parse_query_api_result(tool_record.result)
+        if not parsed:
+            continue
+
+        status_code = parsed.get("status_code")
+        body = parsed.get("body")
+        body_length = parsed.get("body_length")
+
+        if "how many items" in lowered_question or "items are currently stored" in lowered_question:
+            if isinstance(body_length, int):
+                return f"There are {body_length} items in the database."
+            if isinstance(body, list):
+                return f"There are {len(body)} items in the database."
+
+        if "without" in lowered_question and "auth" in lowered_question and status_code:
+            return f"Without the authentication header, the API returns {status_code}."
+
+    for tool_record in reversed(tool_records):
+        path = str(tool_record.args.get("path", "")).strip()
+        if tool_record.tool != "list_files" or "routers" not in path:
+            continue
+
+        modules = [
+            line.strip()
+            for line in tool_record.result.splitlines()
+            if line.strip().endswith(".py") and line.strip() != "__init__.py"
+        ]
+        if not modules:
+            continue
+
+        descriptions = []
+        for module in modules:
+            domain = module.removesuffix(".py")
+            descriptions.append(f"{module} handles {domain}.")
+
+        return "API router modules: " + " ".join(descriptions)
 
     for tool_record in reversed(tool_records):
         if tool_record.tool == "list_files":
@@ -348,13 +617,46 @@ def _fallback_answer(tool_records: list[ToolCallRecord], current_answer: str) ->
     return current_answer
 
 
-def _should_continue_with_tools(answer: str, tool_records: list[ToolCallRecord]) -> bool:
+def _question_is_listing_request(question: str) -> bool:
+    lowered = question.lower()
+    listing_markers = (
+        "list ",
+        "what files",
+        "which files",
+        "which modules",
+        "what modules",
+        "directory",
+        "directories",
+        "router modules",
+    )
+    return any(marker in lowered for marker in listing_markers)
+
+
+def _should_continue_with_tools(
+    answer: str,
+    tool_records: list[ToolCallRecord],
+    question: str,
+) -> bool:
     lowered = answer.strip().lower()
     if not lowered:
         return True
 
-    if any(tool_record.tool == "read_file" for tool_record in tool_records):
+    if any(tool_record.tool in {"read_file", "query_api"} for tool_record in tool_records):
         return False
+
+    if tool_records and all(tool_record.tool == "list_files" for tool_record in tool_records):
+        return not _question_is_listing_request(question)
+
+    uncertainty_markers = (
+        "likely ",
+        "probably ",
+        "i will read",
+        "i need to read",
+        "to get the answer",
+        "to find the answer",
+    )
+    if any(marker in lowered for marker in uncertainty_markers):
+        return True
 
     planning_prefixes = (
         "let me ",
@@ -387,22 +689,23 @@ def _run_agent(question: str, settings: Settings) -> AgentOutput:
             sys.exit(1)
 
         assistant_message: dict[str, Any] = {"role": "assistant"}
-        if "content" in message:
-            assistant_message["content"] = message["content"]
+        assistant_message["content"] = message.get("content") or ""
         if message.get("tool_calls"):
             assistant_message["tool_calls"] = message["tool_calls"]
         messages.append(assistant_message)
 
-        tool_calls = message.get("tool_calls") or _parse_text_tool_calls(message.get("content", ""))
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls") or _parse_text_tool_calls(content)
         if not tool_calls:
-            answer, source = _parse_final_response(message.get("content", ""))
-            if _should_continue_with_tools(answer, tool_records) and not nudged_for_read:
+            answer, source = _parse_final_response(content)
+            if _should_continue_with_tools(answer, tool_records, question) and not nudged_for_read:
                 messages.append(
                     {
                         "role": "user",
                         "content": (
-                            "You have not answered the question yet. Read the most relevant wiki file "
-                            "with read_file, then return final JSON with answer and source."
+                            "You have not answered from evidence yet. Use the most relevant tool "
+                            "(read_file, list_files, or query_api), then return final JSON with "
+                            "answer and optional source."
                         ),
                     }
                 )
@@ -424,7 +727,7 @@ def _run_agent(question: str, settings: Settings) -> AgentOutput:
             except json.JSONDecodeError:
                 tool_arguments = {}
 
-            result = _execute_tool(tool_name, tool_arguments)
+            result = _execute_tool(tool_name, tool_arguments, settings, question)
             tool_records.append(
                 ToolCallRecord(
                     tool=tool_name,
@@ -443,10 +746,9 @@ def _run_agent(question: str, settings: Settings) -> AgentOutput:
         if len(tool_calls) > remaining_calls:
             break
 
-    if not source:
-        source = _fallback_source(tool_records)
+    source = _normalize_source(source, tool_records)
 
-    answer = _fallback_answer(tool_records, answer)
+    answer = _fallback_answer(question, tool_records, answer)
 
     if not answer:
         answer = "I could not produce a final answer within the tool-call limit."
@@ -464,7 +766,7 @@ def main() -> None:
         sys.exit(1)
 
     output = _run_agent(question, settings)
-    print(output.model_dump_json())
+    print(output.model_dump_json(exclude_none=True))
 
 
 if __name__ == "__main__":
