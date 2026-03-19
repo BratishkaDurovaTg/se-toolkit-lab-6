@@ -3,14 +3,14 @@ import sys
 from typing import Any
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    llm_api_key: str
-    llm_api_base: str
-    llm_model: str
+    llm_api_key: str = Field(alias="LLM_API_KEY")
+    llm_api_base: str = Field(alias="LLM_API_BASE")
+    llm_model: str = Field(alias="LLM_MODEL")
 
     model_config = SettingsConfigDict(
         env_file=".env.agent.secret",

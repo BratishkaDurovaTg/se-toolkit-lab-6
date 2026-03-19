@@ -42,12 +42,12 @@ def test_agent_outputs_answer_and_tool_calls() -> None:
     env = os.environ.copy()
     env["LLM_API_KEY"] = "test-key"
     env["LLM_API_BASE"] = f"http://127.0.0.1:{server.server_port}/v1"
-    env["LLM_MODEL"] = "qwen3-coder-plus"
+    env["LLM_MODEL"] = "qwen3-coder-flash"
 
     try:
         result = subprocess.run(
             [sys.executable, "agent.py", "What does REST stand for?"],
-            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")),
+            cwd=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
             capture_output=True,
             text=True,
             env=env,
