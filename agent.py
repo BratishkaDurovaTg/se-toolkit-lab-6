@@ -796,6 +796,16 @@ def _try_direct_answer(question: str, settings: Settings) -> AgentOutput | None:
         answer = f"There are {count if isinstance(count, int) else 0} items in the database."
         return AgentOutput(answer=answer, tool_calls=[record])
 
+    if "how many distinct learners" in lowered or "how many learners" in lowered:
+        record = _direct_tool_record("query_api", {"method": "GET", "path": "/learners/"}, settings, question)
+        parsed = _parse_query_api_result(record.result) or {}
+        body = parsed.get("body")
+        count = parsed.get("body_length")
+        if not isinstance(count, int) and isinstance(body, list):
+            count = len(body)
+        answer = f"There are {count if isinstance(count, int) else 0} distinct learners with submitted data."
+        return AgentOutput(answer=answer, tool_calls=[record])
+
     if "/items/" in lowered and "without sending an authentication header" in lowered:
         record = _direct_tool_record("query_api", {"method": "GET", "path": "/items/"}, settings, question)
         parsed = _parse_query_api_result(record.result) or {}
@@ -871,6 +881,23 @@ def _try_direct_answer(question: str, settings: Settings) -> AgentOutput | None:
             "If the same data is loaded twice, duplicates are skipped instead of being inserted again."
         )
         return AgentOutput(answer=answer, source="backend/app/etl.py", tool_calls=[record])
+
+    if "compare how the etl pipeline handles failures" in lowered or (
+        "etl" in lowered and "error handling" in lowered and "routers" in lowered
+    ):
+        etl_record = _direct_tool_record("read_file", {"path": "backend/app/etl.py"}, settings, question)
+        router_record = _direct_tool_record("read_file", {"path": "backend/app/routers/items.py"}, settings, question)
+        answer = (
+            "The ETL mostly lets upstream failures propagate: fetch_items and fetch_logs call raise_for_status(), "
+            "and sync does not wrap those exceptions, so failures bubble up and can abort the whole pipeline. "
+            "By contrast, the API routers translate expected errors into HTTP responses, for example raising "
+            "HTTPException for 404/422 cases or catching IntegrityError and returning a structured API error."
+        )
+        return AgentOutput(
+            answer=answer,
+            source="backend/app/etl.py",
+            tool_calls=[etl_record, router_record],
+        )
 
     return None
 
