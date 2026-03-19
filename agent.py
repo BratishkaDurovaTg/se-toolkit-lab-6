@@ -247,6 +247,9 @@ def _question_mentions_missing_auth(question: str) -> bool:
     auth_markers = (
         "without authentication",
         "without an authentication header",
+        "without sending an authentication header",
+        "without sending authentication",
+        "without sending auth",
         "without auth",
         "without the api key",
         "missing authentication",
